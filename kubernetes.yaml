@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openai-vllm-mock-config
+  labels:
+    app: openai-vllm-mock
+data:
+  PORT: "8000"
+  MOCK_API_KEY: ""
+  MOCK_LATENCY_MS: "0"
+  MOCK_STREAM_DELAY_MS: "0"
+  MOCK_INCLUDE_REASONING: "true"
+  MOCK_VLLM_VERSION: "0.32.0"
+  MOCK_ENABLE_LOGGING: "true"
+  MOCK_LOG_FORMAT: "json"
+  MOCK_LOG_LEVEL: "INFO"
+  MOCK_ENABLE_OBSERVABILITY: "true"
+  MOCK_MAX_STORE_SIZE: "500"
+  MOCK_MAX_FILE_BYTES: "65536"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openai-vllm-mock
+  labels:
+    app: openai-vllm-mock
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: openai-vllm-mock
+  template:
+    metadata:
+      labels:
+        app: openai-vllm-mock
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: openai-vllm-mock
+          image: openai-vllm-mock:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: openai-vllm-mock-config
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openai-vllm-mock
+  labels:
+    app: openai-vllm-mock
+spec:
+  type: ClusterIP
+  selector:
+    app: openai-vllm-mock
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: openai-vllm-mock-hpa
+  labels:
+    app: openai-vllm-mock
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: openai-vllm-mock
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75

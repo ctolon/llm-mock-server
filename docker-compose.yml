@@ -1,0 +1,28 @@
+services:
+  openai-vllm-mock:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openai-vllm-mock
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - PORT=8000
+      - MOCK_API_KEY=${MOCK_API_KEY:-}
+      - MOCK_LATENCY_MS=${MOCK_LATENCY_MS:-0}
+      - MOCK_STREAM_DELAY_MS=${MOCK_STREAM_DELAY_MS:-0}
+      - MOCK_INCLUDE_REASONING=${MOCK_INCLUDE_REASONING:-true}
+      - MOCK_VLLM_VERSION=${MOCK_VLLM_VERSION:-0.32.0}
+      - MOCK_ENABLE_LOGGING=${MOCK_ENABLE_LOGGING:-true}
+      - MOCK_LOG_FORMAT=${MOCK_LOG_FORMAT:-json}
+      - MOCK_LOG_LEVEL=${MOCK_LOG_LEVEL:-INFO}
+      - MOCK_ENABLE_OBSERVABILITY=${MOCK_ENABLE_OBSERVABILITY:-true}
+      - MOCK_MAX_STORE_SIZE=${MOCK_MAX_STORE_SIZE:-500}
+      - MOCK_MAX_FILE_BYTES=${MOCK_MAX_FILE_BYTES:-65536}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
