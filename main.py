@@ -54,14 +54,18 @@ from mock_data import (
     MOCK_VECTOR_STORES,
     MOCK_VOICES,
     build_tool_calls,
+    compute_relevance_score,
     estimate_tokens,
     generate_embedding_vector,
+    get_active_state_db_path,
     get_random_classification_dict,
     get_random_image_dict,
     get_random_response_dict,
     get_random_transcription_dict,
+    get_rng,
     simple_detokenize,
     simple_tokenize,
+    synthesize_from_json_schema,
 )
 from schemas import (
     AssistantCreateRequest,
@@ -207,9 +211,35 @@ SERVER_STATE: dict[str, Any] = {
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-    """Modern FastAPI lifespan handler managing server initialization and shutdown."""
+    """
+    Modern FastAPI lifespan handler managing server initialization, multi-replica
+    state consistency checks, and graceful shutdown.
+    """
     SERVER_STATE["vllm_version"] = Constants.VLLM_VERSION
     SERVER_STATE["is_sleeping"] = False
+
+    db_path = get_active_state_db_path()
+    if not db_path:
+        logger.warning(
+            "MOCK_STATE_DB_PATH is not configured; stateful stores are running in per-process memory. "
+            "Set replicas=1 (or sessionAffinity=ClientIP) in Kubernetes, or set MOCK_STATE_DB_PATH "
+            "to a shared SQLite file path for multi-replica state consistency.",
+            extra={
+                "structured_data": {
+                    "event": "startup_state_check",
+                    "state_backend": "in_memory",
+                    "recommendation": "Set replicas=1 or configure MOCK_STATE_DB_PATH",
+                }
+            },
+        )
+    else:
+        logger.info(
+            "SQLite shared state backend enabled at %s",
+            db_path,
+            extra={"structured_data": {"event": "startup_state_check", "state_backend": "sqlite", "db_path": db_path}},
+        )
+    for handler in logger.handlers:
+        handler.flush()
     yield
 
 
@@ -222,7 +252,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=Constants.CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -289,8 +319,74 @@ def _finalize_observability_and_log(
     return response
 
 
+def _maybe_build_chaos_error_response(request: Request) -> JSONResponse | None:
+    """
+    Evaluates optional Chaos / Fault-Injection headers (`X-Mock-Error-Status`, `X-Mock-Error-Rate`)
+    or environment variable (`MOCK_ERROR_RATE`) to simulate 429, 500, 502, 503, or 504 errors.
+    """
+    if request.url.path in ("/health", "/ping"):
+        return None
+
+    status_header = request.headers.get(Constants.HEADER_MOCK_ERROR_STATUS, "").strip()
+    rate_header = request.headers.get(
+        Constants.HEADER_MOCK_ERROR_RATE,
+        os.environ.get("MOCK_ERROR_RATE", str(Constants.DEFAULT_ERROR_RATE)),
+    ).strip()
+
+    forced_status: int | None = None
+    if status_header:
+        try:
+            forced_status = int(status_header)
+        except ValueError:
+            forced_status = None
+
+    error_rate = 0.0
+    try:
+        error_rate = max(0.0, min(1.0, float(rate_header)))
+    except ValueError:
+        error_rate = 0.0
+
+    if forced_status is None and error_rate > 0.0 and random.random() < error_rate:
+        forced_status = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    if forced_status is None or forced_status < 400:
+        return None
+
+    custom_msg = request.headers.get(Constants.HEADER_MOCK_ERROR_MESSAGE)
+    if forced_status == status.HTTP_429_TOO_MANY_REQUESTS:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Retry-After": "1"},
+            content={
+                "error": {
+                    "message": custom_msg or "Rate limit reached for requests on mock server.",
+                    "type": "rate_limit_error",
+                    "param": None,
+                    "code": "rate_limit_exceeded",
+                }
+            },
+        )
+
+    return JSONResponse(
+        status_code=forced_status,
+        content={
+            "error": {
+                "message": custom_msg or f"Simulated upstream server error (HTTP {forced_status}).",
+                "type": "server_error",
+                "param": None,
+                "code": f"mock_http_{forced_status}",
+            }
+        },
+    )
+
+
+def _is_malformed_sse_requested(request: Request) -> bool:
+    val = request.headers.get(Constants.HEADER_MOCK_MALFORMED_SSE, "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 # ---------------------------------------------------------------------------
-# Middleware: Real-IP, X-Request-ID, Response-Time, Auth & Latency
+# Middleware: Real-IP, X-Request-ID, Response-Time, Chaos, Auth & Latency
 # ---------------------------------------------------------------------------
 @app.middleware("http")
 async def observability_auth_and_latency_middleware(
@@ -338,6 +434,17 @@ async def observability_auth_and_latency_middleware(
 
     if latency_ms > 0:
         await asyncio.sleep(latency_ms / 1000.0)
+
+    # 3. Optional Chaos / Error Simulation (429, 500, 503, etc.)
+    chaos_res = _maybe_build_chaos_error_response(request)
+    if chaos_res is not None:
+        return _finalize_observability_and_log(
+            request=request,
+            response=chaos_res,
+            request_id=request_id,
+            client_ip=client_ip,
+            start_perf=start_perf,
+        )
 
     SERVER_STATE["server_load"] += 1
     try:
@@ -406,6 +513,7 @@ async def get_server_info() -> dict[str, Any]:
         "server_load": SERVER_STATE["server_load"],
         "total_requests": SERVER_STATE["total_requests"],
         "data_parallel_size": SERVER_STATE["data_parallel_size"],
+        "state_backend": "sqlite" if get_active_state_db_path() else "in_memory",
         "models": [m["id"] for m in MOCK_MODELS],
     }
 
@@ -516,7 +624,7 @@ async def unload_lora_adapter(req: UnloadLoraAdapterRequest) -> PlainTextRespons
 async def list_models() -> dict[str, Any]:
     return {
         "object": "list",
-        "data": MOCK_MODELS,
+        "data": list(MOCK_MODELS),
     }
 
 
@@ -549,9 +657,47 @@ async def delete_model(model_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 3. Chat Completions (/v1/chat/completions)
 # ---------------------------------------------------------------------------
-def _resolve_chat_output(req: ChatCompletionRequest, sample: dict[str, Any]) -> str:
+def _extract_json_schema_from_request(
+    response_format: dict[str, Any] | None,
+    guided_json: str | dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+        js_spec = response_format.get("json_schema")
+        if isinstance(js_spec, dict) and isinstance(js_spec.get("schema"), dict):
+            return js_spec["schema"]
+        if isinstance(response_format.get("schema"), dict):
+            return response_format["schema"]
+    if guided_json is not None:
+        if isinstance(guided_json, dict):
+            return guided_json
+        if isinstance(guided_json, str):
+            try:
+                parsed = json.loads(guided_json)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def _resolve_chat_output(
+    req: ChatCompletionRequest,
+    sample: dict[str, Any],
+    rng: random.Random | None = None,
+) -> str:
+    active_rng = rng or random
     if req.guided_choice and isinstance(req.guided_choice, list):
-        return random.choice(req.guided_choice)
+        return active_rng.choice(req.guided_choice)
+
+    explicit_schema = _extract_json_schema_from_request(req.response_format, req.guided_json)
+    if explicit_schema is not None:
+        synthesized = synthesize_from_json_schema(
+            explicit_schema,
+            sample["structured_json"],
+            explicit_schema,
+            active_rng,
+        )
+        return json.dumps(synthesized)
 
     rf_type = (req.response_format or {}).get("type")
     if rf_type in ("json_object", "json_schema") or req.guided_json is not None:
@@ -560,9 +706,14 @@ def _resolve_chat_output(req: ChatCompletionRequest, sample: dict[str, Any]) -> 
     return sample["content"]
 
 
-def _build_logprobs(text: str, enabled: bool | None) -> dict[str, Any] | None:
+def _build_logprobs(
+    text: str,
+    enabled: bool | None,
+    rng: random.Random | None = None,
+) -> dict[str, Any] | None:
     if not enabled:
         return None
+    active_rng = rng or random
     words = text.split(" ")
     content_logprobs = []
     for idx, word in enumerate(words):
@@ -570,7 +721,7 @@ def _build_logprobs(text: str, enabled: bool | None) -> dict[str, Any] | None:
         content_logprobs.append(
             {
                 "token": token_str,
-                "logprob": round(random.uniform(-0.45, -0.01), 4),
+                "logprob": round(active_rng.uniform(-0.45, -0.01), 4),
                 "bytes": list(token_str.encode("utf-8")),
                 "top_logprobs": [
                     {
@@ -587,18 +738,21 @@ def _build_logprobs(text: str, enabled: bool | None) -> dict[str, Any] | None:
 @app.post("/v1/chat/completions")
 async def create_chat_completion(req: ChatCompletionRequest, request: Request) -> Response:
     created_ts = int(time.time())
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    system_fp = Constants.SYSTEM_FINGERPRINT_CHAT
-
     prompt_text = " ".join(
         str(m.get("content", "") if isinstance(m, dict) else (m.content or ""))
         for m in req.messages
     )
+    rng = get_rng(req.seed, f"{req.model}:{prompt_text}")
+    comp_hex = f"{rng.getrandbits(96):024x}" if req.seed is not None else uuid.uuid4().hex[:24]
+    completion_id = f"chatcmpl-{comp_hex}"
+    system_fp = Constants.SYSTEM_FINGERPRINT_CHAT
+
     prompt_tokens = estimate_tokens(prompt_text)
     include_reasoning = _should_include_reasoning(req.model, req.include_reasoning, req.reasoning_effort)
 
     if req.stream:
         delay_sec = _get_stream_delay_sec(request)
+        malformed_sse = _is_malformed_sse_requested(request)
         return StreamingResponse(
             _stream_chat_completion(
                 req=req,
@@ -608,6 +762,8 @@ async def create_chat_completion(req: ChatCompletionRequest, request: Request) -
                 prompt_tokens=prompt_tokens,
                 include_reasoning=include_reasoning,
                 delay_sec=delay_sec,
+                rng=rng,
+                malformed_sse=malformed_sse,
             ),
             media_type="text/event-stream",
         )
@@ -618,8 +774,8 @@ async def create_chat_completion(req: ChatCompletionRequest, request: Request) -
     safe_n = min(max(1, req.n), Constants.MAX_CHOICES_N)
 
     for idx in range(safe_n):
-        sample = get_random_response_dict()
-        tool_calls = build_tool_calls(req.tools, req.tool_choice, sample)
+        sample = get_random_response_dict(rng)
+        tool_calls = build_tool_calls(req.tools, req.tool_choice, sample, req.parallel_tool_calls, rng)
         reasoning_text = sample["reasoning_content"] if include_reasoning else None
 
         if tool_calls:
@@ -627,7 +783,7 @@ async def create_chat_completion(req: ChatCompletionRequest, request: Request) -
             finish_reason = "tool_calls"
             comp_tokens = estimate_tokens(json.dumps(tool_calls))
         else:
-            content_text = _resolve_chat_output(req, sample)
+            content_text = _resolve_chat_output(req, sample, rng)
             finish_reason = "stop"
             comp_tokens = estimate_tokens(content_text)
 
@@ -649,7 +805,7 @@ async def create_chat_completion(req: ChatCompletionRequest, request: Request) -
             {
                 "index": idx,
                 "message": message_obj,
-                "logprobs": _build_logprobs(content_text or "", req.logprobs),
+                "logprobs": _build_logprobs(content_text or "", req.logprobs, rng),
                 "finish_reason": finish_reason,
                 "stop_reason": None,
             }
@@ -711,8 +867,10 @@ async def get_chat_completion_messages(completion_id: str) -> dict[str, Any]:
 async def update_chat_completion(completion_id: str, body: dict[str, Any]) -> dict[str, Any]:
     if completion_id not in MOCK_CHAT_COMPLETIONS_STORE:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Chat completion {completion_id} not found")
-    MOCK_CHAT_COMPLETIONS_STORE[completion_id]["metadata"] = body.get("metadata", {})
-    return {k: v for k, v in MOCK_CHAT_COMPLETIONS_STORE[completion_id].items() if k != "input_messages"}
+    updated = dict(MOCK_CHAT_COMPLETIONS_STORE[completion_id])
+    updated["metadata"] = body.get("metadata", {})
+    MOCK_CHAT_COMPLETIONS_STORE[completion_id] = updated
+    return {k: v for k, v in updated.items() if k != "input_messages"}
 
 
 @app.delete("/v1/chat/completions/{completion_id}")
@@ -729,9 +887,11 @@ async def _stream_chat_completion(
     prompt_tokens: int,
     include_reasoning: bool,
     delay_sec: float,
+    rng: random.Random | None = None,
+    malformed_sse: bool = False,
 ) -> AsyncGenerator[str, None]:
-    sample = get_random_response_dict()
-    tool_calls = build_tool_calls(req.tools, req.tool_choice, sample)
+    sample = get_random_response_dict(rng)
+    tool_calls = build_tool_calls(req.tools, req.tool_choice, sample, req.parallel_tool_calls, rng)
     reasoning_text = sample["reasoning_content"] if include_reasoning else None
 
     first_chunk = {
@@ -750,6 +910,10 @@ async def _stream_chat_completion(
         ],
     }
     yield f"data: {json.dumps(first_chunk)}\n\n"
+
+    if malformed_sse:
+        yield 'data: {"id": "truncated_malformed_sse_frame"\n\n'
+        return
 
     reasoning_tokens = 0
     if reasoning_text:
@@ -778,39 +942,43 @@ async def _stream_chat_completion(
 
     completion_tokens = 0
     if tool_calls:
-        tc = tool_calls[0]
-        completion_tokens = estimate_tokens(tc["function"]["arguments"])
-        tc_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created_ts,
-            "model": req.model,
-            "system_fingerprint": system_fp,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["function"]["name"],
-                                    "arguments": tc["function"]["arguments"],
-                                },
-                            }
-                        ]
-                    },
-                    "logprobs": None,
-                    "finish_reason": None,
-                }
-            ],
-        }
-        yield f"data: {json.dumps(tc_chunk)}\n\n"
+        for tc_idx, tc in enumerate(tool_calls):
+            args_str = tc["function"]["arguments"]
+            completion_tokens += estimate_tokens(args_str)
+            # Emit tool call header + arguments delta with proper tool index
+            tc_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": req.model,
+                "system_fingerprint": system_fp,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": tc_idx,
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["function"]["name"],
+                                        "arguments": args_str,
+                                    },
+                                }
+                            ]
+                        },
+                        "logprobs": None,
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(tc_chunk)}\n\n"
+            if delay_sec > 0:
+                await asyncio.sleep(delay_sec)
         finish_reason = "tool_calls"
     else:
-        output_text = _resolve_chat_output(req, sample)
+        output_text = _resolve_chat_output(req, sample, rng)
         words = output_text.split(" ")
         completion_tokens = len(words)
         for i, word in enumerate(words):
@@ -879,7 +1047,6 @@ async def _stream_chat_completion(
 @app.post("/v1/completions")
 async def create_completion(req: CompletionRequest, request: Request) -> Response:
     created_ts = int(time.time())
-    comp_id = f"cmpl-{uuid.uuid4().hex[:24]}"
     system_fp = Constants.SYSTEM_FINGERPRINT_COMPLETION
 
     prompts: list[str]
@@ -890,10 +1057,14 @@ async def create_completion(req: CompletionRequest, request: Request) -> Respons
     else:
         prompts = ["token_input"]
 
+    rng = get_rng(req.seed, f"{req.model}:{'|'.join(prompts)}")
+    comp_hex = f"{rng.getrandbits(96):024x}" if req.seed is not None else uuid.uuid4().hex[:24]
+    comp_id = f"cmpl-{comp_hex}"
     prompt_tokens = sum(estimate_tokens(p) for p in prompts)
 
     if req.stream:
         delay_sec = _get_stream_delay_sec(request)
+        malformed_sse = _is_malformed_sse_requested(request)
         return StreamingResponse(
             _stream_text_completion(
                 req=req,
@@ -902,6 +1073,8 @@ async def create_completion(req: CompletionRequest, request: Request) -> Respons
                 system_fp=system_fp,
                 prompt_tokens=prompt_tokens,
                 delay_sec=delay_sec,
+                rng=rng,
+                malformed_sse=malformed_sse,
             ),
             media_type="text/event-stream",
         )
@@ -912,7 +1085,7 @@ async def create_completion(req: CompletionRequest, request: Request) -> Respons
     safe_n = min(max(1, req.n), Constants.MAX_CHOICES_N)
     for prompt_str in prompts:
         for _ in range(safe_n):
-            sample = get_random_response_dict()
+            sample = get_random_response_dict(rng)
             text = sample["completion"].lstrip()
             if req.echo and prompt_str:
                 text = f"{prompt_str} {text}"
@@ -959,8 +1132,14 @@ async def _stream_text_completion(
     system_fp: str,
     prompt_tokens: int,
     delay_sec: float,
+    rng: random.Random | None = None,
+    malformed_sse: bool = False,
 ) -> AsyncGenerator[str, None]:
-    sample = get_random_response_dict()
+    if malformed_sse:
+        yield 'data: {"id": "truncated_malformed_sse_frame"\n\n'
+        return
+
+    sample = get_random_response_dict(rng)
     text = sample["completion"].lstrip()
     words = text.split(" ")
 
@@ -1008,15 +1187,25 @@ async def _stream_text_completion(
 # ---------------------------------------------------------------------------
 @app.post("/v1/responses")
 async def create_response(req: ResponsesRequest, request: Request) -> Response:
-    resp_id = f"resp_{uuid.uuid4().hex[:24]}"
     created_ts = int(time.time())
-    sample = get_random_response_dict()
-
     input_str = req.input if isinstance(req.input, str) else json.dumps(req.input)
+    rng = get_rng(req.seed, f"{req.model}:{input_str}")
+    resp_hex = f"{rng.getrandbits(96):024x}" if req.seed is not None else uuid.uuid4().hex[:24]
+    resp_id = f"resp_{resp_hex}"
+    sample = get_random_response_dict(rng)
     input_tokens = estimate_tokens(input_str)
 
-    text_format_type = (req.text or {}).get("format", {}).get("type")
-    if text_format_type in ("json_object", "json_schema"):
+    text_format = (req.text or {}).get("format", {})
+    text_format_type = text_format.get("type") if isinstance(text_format, dict) else None
+    if text_format_type == "json_schema" and isinstance(text_format.get("schema"), dict):
+        synthesized = synthesize_from_json_schema(
+            text_format["schema"],
+            sample["structured_json"],
+            text_format["schema"],
+            rng,
+        )
+        output_text = json.dumps(synthesized)
+    elif text_format_type in ("json_object", "json_schema"):
         output_text = json.dumps(sample["structured_json"])
     else:
         output_text = sample["content"]
@@ -1035,19 +1224,19 @@ async def create_response(req: ResponsesRequest, request: Request) -> Response:
         }
     ]
 
-    tool_calls = build_tool_calls(req.tools, req.tool_choice, sample)
+    tool_calls = build_tool_calls(req.tools, req.tool_choice, sample, req.parallel_tool_calls, rng)
     if tool_calls:
-        tc = tool_calls[0]
-        output_items.append(
-            {
-                "id": f"fc_{uuid.uuid4().hex[:24]}",
-                "type": "function_call",
-                "call_id": tc["id"],
-                "name": tc["function"]["name"],
-                "arguments": tc["function"]["arguments"],
-                "status": "completed",
-            }
-        )
+        for tc in tool_calls:
+            output_items.append(
+                {
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
+                    "type": "function_call",
+                    "call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"],
+                    "status": "completed",
+                }
+            )
     else:
         output_items.append(
             {
@@ -1077,7 +1266,7 @@ async def create_response(req: ResponsesRequest, request: Request) -> Response:
         "model": req.model,
         "output": output_items,
         "output_text": "" if tool_calls else output_text,
-        "parallel_tool_calls": True,
+        "parallel_tool_calls": req.parallel_tool_calls if req.parallel_tool_calls is not None else True,
         "previous_response_id": req.previous_response_id,
         "reasoning": req.reasoning or {"effort": "medium", "summary": "auto"},
         "store": req.store,
@@ -1103,8 +1292,9 @@ async def create_response(req: ResponsesRequest, request: Request) -> Response:
 
     if req.stream:
         delay_sec = _get_stream_delay_sec(request)
+        malformed_sse = _is_malformed_sse_requested(request)
         return StreamingResponse(
-            _stream_responses_api(response_obj, output_text, delay_sec),
+            _stream_responses_api(response_obj, output_text, delay_sec, malformed_sse),
             media_type="text/event-stream",
         )
 
@@ -1115,31 +1305,82 @@ async def _stream_responses_api(
     response_obj: dict[str, Any],
     output_text: str,
     delay_sec: float,
+    malformed_sse: bool = False,
 ) -> AsyncGenerator[str, None]:
     created_event = {"type": "response.created", "response": {**response_obj, "status": "in_progress"}}
     yield f"event: response.created\ndata: {json.dumps(created_event)}\n\n"
 
-    for i, word in enumerate(output_text.split(" ")):
-        delta = word if i == 0 else f" {word}"
-        delta_event = {
-            "type": "response.output_text.delta",
-            "item_id": response_obj["output"][-1]["id"],
-            "output_index": len(response_obj["output"]) - 1,
-            "content_index": 0,
-            "delta": delta,
-        }
-        yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
-        if delay_sec > 0:
-            await asyncio.sleep(delay_sec)
+    in_progress_event = {"type": "response.in_progress", "response": {**response_obj, "status": "in_progress"}}
+    yield f"event: response.in_progress\ndata: {json.dumps(in_progress_event)}\n\n"
 
-    done_text_event = {
-        "type": "response.output_text.done",
-        "item_id": response_obj["output"][-1]["id"],
-        "output_index": len(response_obj["output"]) - 1,
-        "content_index": 0,
-        "text": output_text,
-    }
-    yield f"event: response.output_text.done\ndata: {json.dumps(done_text_event)}\n\n"
+    if malformed_sse:
+        yield 'event: response.output_text.delta\ndata: {"truncated_json": \n\n'
+        return
+
+    for out_idx, item in enumerate(response_obj.get("output", [])):
+        added_event = {
+            "type": "response.output_item.added",
+            "output_index": out_idx,
+            "item": item,
+        }
+        yield f"event: response.output_item.added\ndata: {json.dumps(added_event)}\n\n"
+
+        item_type = item.get("type")
+        if item_type == "function_call":
+            args_str = str(item.get("arguments", "{}"))
+            chunk_size = max(1, len(args_str) // 2)
+            for start in range(0, len(args_str), chunk_size):
+                piece = args_str[start : start + chunk_size]
+                fc_delta = {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item["id"],
+                    "output_index": out_idx,
+                    "call_id": item["call_id"],
+                    "delta": piece,
+                }
+                yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(fc_delta)}\n\n"
+                if delay_sec > 0:
+                    await asyncio.sleep(delay_sec)
+
+            fc_done = {
+                "type": "response.function_call_arguments.done",
+                "item_id": item["id"],
+                "output_index": out_idx,
+                "call_id": item["call_id"],
+                "name": item["name"],
+                "arguments": args_str,
+            }
+            yield f"event: response.function_call_arguments.done\ndata: {json.dumps(fc_done)}\n\n"
+
+        elif item_type == "message":
+            for i, word in enumerate(output_text.split(" ")):
+                delta = word if i == 0 else f" {word}"
+                delta_event = {
+                    "type": "response.output_text.delta",
+                    "item_id": item["id"],
+                    "output_index": out_idx,
+                    "content_index": 0,
+                    "delta": delta,
+                }
+                yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
+                if delay_sec > 0:
+                    await asyncio.sleep(delay_sec)
+
+            done_text_event = {
+                "type": "response.output_text.done",
+                "item_id": item["id"],
+                "output_index": out_idx,
+                "content_index": 0,
+                "text": output_text,
+            }
+            yield f"event: response.output_text.done\ndata: {json.dumps(done_text_event)}\n\n"
+
+        done_item_event = {
+            "type": "response.output_item.done",
+            "output_index": out_idx,
+            "item": item,
+        }
+        yield f"event: response.output_item.done\ndata: {json.dumps(done_item_event)}\n\n"
 
     completed_event = {"type": "response.completed", "response": response_obj}
     yield f"event: response.completed\ndata: {json.dumps(completed_event)}\n\n"
@@ -1179,8 +1420,10 @@ async def delete_response_by_id(response_id: str) -> dict[str, Any]:
 @app.post("/v1/responses/{response_id}/cancel")
 async def cancel_response_by_id(response_id: str) -> dict[str, Any]:
     if response_id in MOCK_RESPONSES_STORE:
-        MOCK_RESPONSES_STORE[response_id]["status"] = "cancelled"
-        return MOCK_RESPONSES_STORE[response_id]
+        updated = dict(MOCK_RESPONSES_STORE[response_id])
+        updated["status"] = "cancelled"
+        MOCK_RESPONSES_STORE[response_id] = updated
+        return updated
     return {"id": response_id, "object": "response", "status": "cancelled"}
 
 
@@ -1223,12 +1466,17 @@ async def create_embeddings(req: EmbeddingRequest) -> dict[str, Any]:
     data = []
     total_tokens = 0
     for idx, item in enumerate(items):
+        item_rng = get_rng(req.seed, f"{req.model}:{item}:{idx}")
         total_tokens += estimate_tokens(item)
         data.append(
             {
                 "object": "embedding",
                 "index": idx,
-                "embedding": generate_embedding_vector(dimensions=dims, encoding_format=req.encoding_format),
+                "embedding": generate_embedding_vector(
+                    dimensions=dims,
+                    encoding_format=req.encoding_format,
+                    rng=item_rng,
+                ),
             }
         )
 
@@ -1276,14 +1524,16 @@ async def create_pooling(req: PoolingRequest) -> dict[str, Any]:
 @app.post("/v2/score")
 @app.post("/score")
 async def create_score(req: ScoreRequest) -> dict[str, Any]:
+    t1_list = [req.text_1] if isinstance(req.text_1, str) else req.text_1
     t2_list = [req.text_2] if isinstance(req.text_2, str) else req.text_2[: Constants.MAX_BATCH_INPUT_ITEMS]
     data = []
-    for idx, _ in enumerate(t2_list):
+    for idx, t2_item in enumerate(t2_list):
+        t1_item = t1_list[idx % len(t1_list)] if t1_list else ""
         data.append(
             {
                 "index": idx,
                 "object": "score",
-                "score": round(random.uniform(0.55, 0.99), 4),
+                "score": compute_relevance_score(str(t1_item), str(t2_item)),
             }
         )
     return {
@@ -1305,7 +1555,7 @@ async def create_rerank(req: RerankRequest) -> dict[str, Any]:
         doc_text = doc if isinstance(doc, str) else doc.get("text", json.dumps(doc))
         entry: dict[str, Any] = {
             "index": idx,
-            "relevance_score": round(random.uniform(0.40, 0.99), 4),
+            "relevance_score": compute_relevance_score(req.query, doc_text),
         }
         if req.return_documents:
             entry["document"] = {"text": doc_text}
@@ -1329,8 +1579,9 @@ async def create_rerank(req: RerankRequest) -> dict[str, Any]:
 async def create_classify(req: ClassifyRequest) -> dict[str, Any]:
     items = [req.input] if isinstance(req.input, str) else req.input[: Constants.MAX_BATCH_INPUT_ITEMS]
     data = []
-    for idx, _ in enumerate(items):
-        sample_cls = get_random_classification_dict()
+    for idx, item_str in enumerate(items):
+        rng = get_rng(None, str(item_str))
+        sample_cls = get_random_classification_dict(rng)
         data.append(
             {
                 "index": idx,
@@ -1374,7 +1625,10 @@ async def tokenize_text(req: TokenizeRequest) -> dict[str, Any]:
         "tokens": tokens,
     }
     if req.return_token_strs:
-        resp["token_strs"] = [f"tok_{t}" for t in tokens]
+        resp["token_strs"] = [
+            "<|begin_of_text|>" if t == Constants.BOS_TOKEN_ID else simple_detokenize([t])
+            for t in tokens
+        ]
     return resp
 
 
@@ -1532,7 +1786,7 @@ async def create_moderation(req: ModerationRequest) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 12. OpenAI Files Endpoints (/v1/files)
+# 12. OpenAI Files Endpoints (/v1/files) with Explicit 413 Size Enforcement
 # ---------------------------------------------------------------------------
 @app.get("/v1/files")
 async def list_files(purpose: Annotated[str | None, Query()] = None) -> dict[str, Any]:
@@ -1544,13 +1798,29 @@ async def list_files(purpose: Annotated[str | None, Query()] = None) -> dict[str
     return {"object": "list", "data": files, "has_more": False}
 
 
-@app.post("/v1/files")
+@app.post("/v1/files", response_model=None)
 async def upload_file(
     file: Annotated[UploadFile, File()],
     purpose: Annotated[str, Form()] = "batch",
-) -> dict[str, Any]:
-    raw_bytes = await file.read(MAX_STORED_FILE_CONTENT_BYTES)
+) -> Response | dict[str, Any]:
+    max_allowed = int(os.environ.get("MOCK_MAX_FILE_BYTES", str(MAX_STORED_FILE_CONTENT_BYTES)))
+    raw_bytes = await file.read(max_allowed + 1)
     await file.close()
+    if len(raw_bytes) > max_allowed:
+        return JSONResponse(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            content={
+                "error": {
+                    "message": (
+                        f"Uploaded file exceeds maximum allowed size of {max_allowed} bytes. "
+                        "Increase MOCK_MAX_FILE_BYTES if larger mock files are required."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "file",
+                    "code": "file_too_large",
+                }
+            },
+        )
     file_entry = {
         "id": f"file-{uuid.uuid4().hex[:20]}",
         "object": "file",
@@ -1592,7 +1862,7 @@ async def delete_file(file_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 @app.get("/v1/batches")
 async def list_batches() -> dict[str, Any]:
-    return {"object": "list", "data": MOCK_BATCHES_STORE, "has_more": False}
+    return {"object": "list", "data": list(MOCK_BATCHES_STORE), "has_more": False}
 
 
 @app.post("/v1/batches")
@@ -1634,11 +1904,14 @@ async def retrieve_batch(batch_id: str) -> dict[str, Any]:
 
 @app.post("/v1/batches/{batch_id}/cancel")
 async def cancel_batch(batch_id: str) -> dict[str, Any]:
-    for b in MOCK_BATCHES_STORE:
+    items = list(MOCK_BATCHES_STORE)
+    for idx, b in enumerate(items):
         if b["id"] == batch_id:
-            b["status"] = "cancelled"
-            b["cancelled_at"] = int(time.time())
-            return b
+            updated = dict(b)
+            updated["status"] = "cancelled"
+            updated["cancelled_at"] = int(time.time())
+            MOCK_BATCHES_STORE[idx] = updated
+            return updated
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Batch {batch_id} not found")
 
 
@@ -1647,7 +1920,7 @@ async def cancel_batch(batch_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 @app.get("/v1/fine_tuning/jobs")
 async def list_fine_tuning_jobs() -> dict[str, Any]:
-    return {"object": "list", "data": MOCK_FINE_TUNING_STORE, "has_more": False}
+    return {"object": "list", "data": list(MOCK_FINE_TUNING_STORE), "has_more": False}
 
 
 @app.post("/v1/fine_tuning/jobs")
@@ -1685,10 +1958,13 @@ async def retrieve_fine_tuning_job(fine_tuning_job_id: str) -> dict[str, Any]:
 
 @app.post("/v1/fine_tuning/jobs/{fine_tuning_job_id}/cancel")
 async def cancel_fine_tuning_job(fine_tuning_job_id: str) -> dict[str, Any]:
-    for job in MOCK_FINE_TUNING_STORE:
+    items = list(MOCK_FINE_TUNING_STORE)
+    for idx, job in enumerate(items):
         if job["id"] == fine_tuning_job_id:
-            job["status"] = "cancelled"
-            return job
+            updated = dict(job)
+            updated["status"] = "cancelled"
+            MOCK_FINE_TUNING_STORE[idx] = updated
+            return updated
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Fine-tuning job {fine_tuning_job_id} not found")
 
 
@@ -1752,12 +2028,26 @@ async def create_upload(req: UploadCreateRequest) -> dict[str, Any]:
     return upload_obj
 
 
-@app.post("/v1/uploads/{upload_id}/parts")
+@app.post("/v1/uploads/{upload_id}/parts", response_model=None)
 async def add_upload_part(
     upload_id: str,
     data: Annotated[UploadFile, File()],
-) -> dict[str, Any]:
+) -> Response | dict[str, Any]:
+    max_allowed = int(os.environ.get("MOCK_MAX_FILE_BYTES", str(MAX_STORED_FILE_CONTENT_BYTES)))
+    chunk = await data.read(max_allowed + 1)
     await data.close()
+    if len(chunk) > max_allowed:
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content={
+                "error": {
+                    "message": f"Upload part exceeds maximum allowed size of {max_allowed} bytes.",
+                    "type": "invalid_request_error",
+                    "param": "data",
+                    "code": "part_too_large",
+                }
+            },
+        )
     return {
         "id": f"part_{uuid.uuid4().hex[:20]}",
         "object": "upload.part",
@@ -1769,16 +2059,18 @@ async def add_upload_part(
 @app.post("/v1/uploads/{upload_id}/complete")
 async def complete_upload(upload_id: str, req: UploadCompleteRequest) -> dict[str, Any]:
     _ = req
-    upload_obj = MOCK_UPLOADS_STORE.get(
-        upload_id,
-        {
-            "id": upload_id,
-            "object": "upload",
-            "bytes": 1024,
-            "created_at": int(time.time()),
-            "filename": "completed_upload.jsonl",
-            "purpose": "batch",
-        },
+    upload_obj = dict(
+        MOCK_UPLOADS_STORE.get(
+            upload_id,
+            {
+                "id": upload_id,
+                "object": "upload",
+                "bytes": 1024,
+                "created_at": int(time.time()),
+                "filename": "completed_upload.jsonl",
+                "purpose": "batch",
+            },
+        )
     )
     upload_obj["status"] = "completed"
     upload_obj["file"] = {
@@ -1789,13 +2081,15 @@ async def complete_upload(upload_id: str, req: UploadCompleteRequest) -> dict[st
         "filename": upload_obj["filename"],
         "purpose": upload_obj["purpose"],
     }
+    MOCK_UPLOADS_STORE[upload_id] = upload_obj
     return upload_obj
 
 
 @app.post("/v1/uploads/{upload_id}/cancel")
 async def cancel_upload(upload_id: str) -> dict[str, Any]:
-    upload_obj = MOCK_UPLOADS_STORE.get(upload_id, {"id": upload_id, "object": "upload"})
+    upload_obj = dict(MOCK_UPLOADS_STORE.get(upload_id, {"id": upload_id, "object": "upload"}))
     upload_obj["status"] = "cancelled"
+    MOCK_UPLOADS_STORE[upload_id] = upload_obj
     return upload_obj
 
 
@@ -1804,7 +2098,7 @@ async def cancel_upload(upload_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 @app.get("/v1/vector_stores")
 async def list_vector_stores() -> dict[str, Any]:
-    return {"object": "list", "data": MOCK_VECTOR_STORES, "has_more": False}
+    return {"object": "list", "data": list(MOCK_VECTOR_STORES), "has_more": False}
 
 
 @app.post("/v1/vector_stores")
@@ -1864,7 +2158,7 @@ async def search_vector_store(vector_store_id: str, req: VectorStoreSearchReques
 # ---------------------------------------------------------------------------
 @app.get("/v1/assistants")
 async def list_assistants() -> dict[str, Any]:
-    return {"object": "list", "data": MOCK_ASSISTANTS_STORE, "has_more": False}
+    return {"object": "list", "data": list(MOCK_ASSISTANTS_STORE), "has_more": False}
 
 
 @app.post("/v1/assistants")
@@ -1939,9 +2233,10 @@ async def create_thread_message(thread_id: str, req: ThreadMessageCreateRequest)
         "content": [{"type": "text", "text": {"value": text_val, "annotations": []}}],
         "metadata": req.metadata or {},
     }
-    MOCK_THREAD_MESSAGES_STORE.setdefault(
-        thread_id, BoundedListStore(max_size=Constants.MAX_THREAD_SUBSTORE_SIZE)
-    ).append(msg_obj)
+    existing = list(MOCK_THREAD_MESSAGES_STORE.get(thread_id, []))
+    store = BoundedListStore(existing, max_size=Constants.MAX_THREAD_SUBSTORE_SIZE)
+    store.append(msg_obj)
+    MOCK_THREAD_MESSAGES_STORE[thread_id] = store
     return msg_obj
 
 
@@ -1978,9 +2273,10 @@ async def create_thread_run(thread_id: str, req: ThreadRunCreateRequest) -> dict
         "instructions": req.instructions or sample["content"],
         "usage": {"prompt_tokens": 20, "completion_tokens": 45, "total_tokens": 65},
     }
-    MOCK_THREAD_RUNS_STORE.setdefault(
-        thread_id, BoundedListStore(max_size=Constants.MAX_THREAD_SUBSTORE_SIZE)
-    ).append(run_obj)
+    existing = list(MOCK_THREAD_RUNS_STORE.get(thread_id, []))
+    store = BoundedListStore(existing, max_size=Constants.MAX_THREAD_SUBSTORE_SIZE)
+    store.append(run_obj)
+    MOCK_THREAD_RUNS_STORE[thread_id] = store
     return run_obj
 
 
@@ -2014,20 +2310,24 @@ async def sagemaker_invocations(payload: dict[str, Any], request: Request) -> Re
 
 @app.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket) -> None:
-    """OpenAI & vLLM Realtime API WebSocket endpoint."""
+    """
+    OpenAI & vLLM Realtime API WebSocket endpoint supporting session management,
+    input_audio_buffer events, conversation.item.create, and full response lifecycle events.
+    """
     await websocket.accept()
     session_id = f"sess_{uuid.uuid4().hex[:20]}"
+    session_state: dict[str, Any] = {
+        "id": session_id,
+        "object": "realtime.session",
+        "model": websocket.query_params.get("model", Constants.DEFAULT_REALTIME_MODEL),
+        "modalities": ["text", "audio"],
+        "voice": Constants.DEFAULT_VOICE,
+    }
     await websocket.send_json(
         {
             "event_id": f"event_{uuid.uuid4().hex[:16]}",
             "type": "session.created",
-            "session": {
-                "id": session_id,
-                "object": "realtime.session",
-                "model": websocket.query_params.get("model", Constants.DEFAULT_REALTIME_MODEL),
-                "modalities": ["text", "audio"],
-                "voice": Constants.DEFAULT_VOICE,
-            },
+            "session": session_state,
         }
     )
     try:
@@ -2036,25 +2336,106 @@ async def realtime_websocket(websocket: WebSocket) -> None:
             try:
                 client_event = json.loads(raw_msg)
             except json.JSONDecodeError:
-                client_event = {"type": "response.create"}
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "error",
+                        "error": {"type": "invalid_request_error", "message": "Invalid JSON payload."},
+                    }
+                )
+                continue
 
             ev_type = client_event.get("type", "")
             sample = get_random_response_dict()
 
             if ev_type == "session.update":
+                session_state.update(client_event.get("session", {}))
                 await websocket.send_json(
                     {
                         "event_id": f"event_{uuid.uuid4().hex[:16]}",
                         "type": "session.updated",
-                        "session": client_event.get("session", {}),
+                        "session": session_state,
+                    }
+                )
+            elif ev_type == "input_audio_buffer.append":
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "input_audio_buffer.speech_started",
+                        "audio_start_ms": 0,
+                        "item_id": f"item_{uuid.uuid4().hex[:16]}",
+                    }
+                )
+            elif ev_type == "input_audio_buffer.commit":
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "input_audio_buffer.committed",
+                        "item_id": f"item_{uuid.uuid4().hex[:16]}",
+                    }
+                )
+            elif ev_type == "input_audio_buffer.clear":
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "input_audio_buffer.cleared",
+                    }
+                )
+            elif ev_type == "conversation.item.create":
+                item = client_event.get("item", {"id": f"item_{uuid.uuid4().hex[:16]}", "type": "message"})
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "conversation.item.created",
+                        "item": item,
+                    }
+                )
+            elif ev_type == "response.cancel":
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "response.cancelled",
                     }
                 )
             else:
+                resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+                item_id = f"item_{uuid.uuid4().hex[:16]}"
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "response.created",
+                        "response": {"id": resp_id, "object": "realtime.response", "status": "in_progress"},
+                    }
+                )
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "response.output_item.added",
+                        "response_id": resp_id,
+                        "output_index": 0,
+                        "item": {"id": item_id, "type": "message", "role": "assistant"},
+                    }
+                )
                 await websocket.send_json(
                     {
                         "event_id": f"event_{uuid.uuid4().hex[:16]}",
                         "type": "response.text.delta",
+                        "response_id": resp_id,
+                        "item_id": item_id,
+                        "output_index": 0,
+                        "content_index": 0,
                         "delta": sample["content"],
+                    }
+                )
+                await websocket.send_json(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                        "type": "response.text.done",
+                        "response_id": resp_id,
+                        "item_id": item_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": sample["content"],
                     }
                 )
                 await websocket.send_json(
@@ -2062,11 +2443,12 @@ async def realtime_websocket(websocket: WebSocket) -> None:
                         "event_id": f"event_{uuid.uuid4().hex[:16]}",
                         "type": "response.done",
                         "response": {
-                            "id": f"resp_{uuid.uuid4().hex[:16]}",
+                            "id": resp_id,
                             "object": "realtime.response",
                             "status": "completed",
                             "output": [
                                 {
+                                    "id": item_id,
                                     "type": "message",
                                     "role": "assistant",
                                     "content": [{"type": "text", "text": sample["content"]}],

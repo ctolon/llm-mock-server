@@ -495,29 +495,61 @@ def test_extended_openai_endpoints_and_realtime_ws() -> None:
         created_ev = ws.receive_json()
         assert created_ev["type"] == "session.created"
         assert created_ev["session"]["model"] == Constants.MODEL_GPT_SOL_REALTIME
+
+        ws.send_text(json.dumps({"type": "session.update", "session": {"instructions": "Be concise"}}))
+        updated_ev = ws.receive_json()
+        assert updated_ev["type"] == "session.updated"
+        assert updated_ev["session"]["instructions"] == "Be concise"
+
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": "UklGRg=="}))
+        speech_ev = ws.receive_json()
+        assert speech_ev["type"] == "input_audio_buffer.speech_started"
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        committed_ev = ws.receive_json()
+        assert committed_ev["type"] == "input_audio_buffer.committed"
+
         ws.send_text(json.dumps({"type": "response.create"}))
+        resp_created = ws.receive_json()
+        assert resp_created["type"] == "response.created"
+        item_added = ws.receive_json()
+        assert item_added["type"] == "response.output_item.added"
         delta_ev = ws.receive_json()
         assert delta_ev["type"] == "response.text.delta"
+        text_done = ws.receive_json()
+        assert text_done["type"] == "response.text.done"
         done_ev = ws.receive_json()
         assert done_ev["type"] == "response.done"
 
 
 def test_bounded_stores_prevent_memory_leaks() -> None:
-    # 1. Verify BoundedListStore FIFO eviction cap
-    bounded_list = BoundedListStore([{"id": i} for i in range(5)], max_size=10)
+    # 1. Verify BoundedListStore FIFO eviction cap (count + byte budget)
+    bounded_list = BoundedListStore([{"id": i} for i in range(5)], max_size=10, max_bytes=1024 * 1024)
     for i in range(5, 25):
         bounded_list.append({"id": i})
     assert len(bounded_list) == 10
     assert bounded_list[0]["id"] == 15
     assert bounded_list[-1]["id"] == 24
 
-    # 2. Verify BoundedDictStore LRU/FIFO capacity eviction cap
-    bounded_dict = BoundedDictStore(max_size=10)
+    # Verify byte cap eviction on BoundedListStore
+    byte_capped_list = BoundedListStore(max_size=100, max_bytes=200)
+    for i in range(10):
+        byte_capped_list.append({"payload": "x" * 60, "idx": i})
+    assert byte_capped_list.total_bytes <= 200
+    assert len(byte_capped_list) <= 3
+
+    # 2. Verify BoundedDictStore LRU/FIFO capacity eviction cap + byte budget
+    bounded_dict = BoundedDictStore(max_size=10, max_bytes=1024 * 1024)
     for i in range(25):
         bounded_dict[f"key_{i}"] = {"val": i}
     assert len(bounded_dict) == 10
     assert "key_0" not in bounded_dict
     assert "key_24" in bounded_dict
+
+    byte_capped_dict = BoundedDictStore(max_size=100, max_bytes=250)
+    for i in range(10):
+        byte_capped_dict[f"k_{i}"] = {"blob": "y" * 70}
+    assert byte_capped_dict.total_bytes <= 250
+    assert len(byte_capped_dict) <= 3
 
 
 def test_stdout_json_and_text_logging_real_ip_and_request_id(monkeypatch: Any) -> None:
@@ -586,4 +618,260 @@ def test_stdout_json_and_text_logging_real_ip_and_request_id(monkeypatch: Any) -
         assert buf.getvalue() == ""
     finally:
         logger.removeHandler(stream_handler)
+
+
+def test_p0_responses_api_streaming_tool_calls() -> None:
+    """Verify P0-1: /v1/responses streaming with tools emits proper function_call SSE events."""
+    tools = [
+        {
+            "type": "function",
+            "name": "query_cluster_metrics",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cluster_id": {"type": "string"},
+                    "window_minutes": {"type": "integer"},
+                },
+                "required": ["cluster_id", "window_minutes"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "scale_node_pool",
+            "parameters": {
+                "type": "object",
+                "properties": {"replicas": {"type": "integer"}},
+            },
+        },
+    ]
+    res = client.post(
+        "/v1/responses",
+        json={
+            "model": Constants.MODEL_GPT_SOL,
+            "input": "Check cluster metrics and scale node pool",
+            "tools": tools,
+            "stream": True,
+        },
+    )
+    assert res.status_code == 200
+    raw_lines = [line for line in res.text.splitlines() if line.startswith("data: ") and line != "data: [DONE]"]
+    events = [json.loads(line[len("data: ") :]) for line in raw_lines]
+    event_types = [ev["type"] for ev in events]
+
+    assert "response.created" in event_types
+    assert "response.in_progress" in event_types
+    assert "response.output_item.added" in event_types
+    assert "response.function_call_arguments.delta" in event_types
+    assert "response.function_call_arguments.done" in event_types
+    assert "response.output_item.done" in event_types
+    assert "response.completed" in event_types
+    # Must NOT emit output_text.delta when tool calls are streamed
+    assert "response.output_text.delta" not in event_types
+
+
+def test_p0_sqlite_shared_state_and_startup_warning(tmp_path: Any, monkeypatch: Any) -> None:
+    """Verify P0-2: Optional SQLite cross-replica state sync and startup warning when disabled."""
+    import logging
+    from main import StdoutStreamingFormatter, logger
+
+    # 1. Verify SQLite state sync across two separate BoundedDictStore instances (simulating 2 pods/workers)
+    db_file = str(tmp_path / "shared_mock_state.db")
+    monkeypatch.setenv("MOCK_STATE_DB_PATH", db_file)
+
+    pod_a_store = BoundedDictStore(max_size=100, store_name="test_cross_pod")
+    pod_b_store = BoundedDictStore(max_size=100, store_name="test_cross_pod")
+
+    pod_a_store["resp_shared_1"] = {"id": "resp_shared_1", "status": "completed"}
+    # Pod B should immediately retrieve it from SQLite even though it wasn't in Pod B's local memory
+    fetched = pod_b_store.get("resp_shared_1")
+    assert fetched is not None
+    assert fetched["id"] == "resp_shared_1"
+
+    # 2. Verify startup warning when MOCK_STATE_DB_PATH is empty
+    monkeypatch.setenv("MOCK_STATE_DB_PATH", "")
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(StdoutStreamingFormatter())
+    logger.addHandler(handler)
+    try:
+        with TestClient(app):
+            pass
+        logs = buf.getvalue()
+        assert "MOCK_STATE_DB_PATH is not configured" in logs
+        assert "replicas=1" in logs
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_p0_deterministic_seed_and_deterministic_mode(monkeypatch: Any) -> None:
+    """Verify P0-3: Request seed and MOCK_DETERMINISTIC produce identical outputs across runs."""
+    r1 = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": Constants.MODEL_CLAUDE_OPUS,
+            "messages": [{"role": "user", "content": "Snapshot test prompt"}],
+            "seed": 42,
+        },
+    ).json()
+    r2 = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": Constants.MODEL_CLAUDE_OPUS,
+            "messages": [{"role": "user", "content": "Snapshot test prompt"}],
+            "seed": 42,
+        },
+    ).json()
+    assert r1["choices"][0]["message"]["content"] == r2["choices"][0]["message"]["content"]
+
+    # Also test MOCK_DETERMINISTIC=true without explicit seed
+    monkeypatch.setenv("MOCK_DETERMINISTIC", "true")
+    d1 = client.post(
+        "/v1/completions",
+        json={"model": Constants.MODEL_GPT_SOL, "prompt": "Deterministic completion prompt"},
+    ).json()
+    d2 = client.post(
+        "/v1/completions",
+        json={"model": Constants.MODEL_GPT_SOL, "prompt": "Deterministic completion prompt"},
+    ).json()
+    assert d1["choices"][0]["text"] == d2["choices"][0]["text"]
+
+
+def test_p1_json_schema_synthesis_and_multi_tool_streaming() -> None:
+    """Verify P1-1 (JSON Schema recursive synthesis) and P1-2 (multi-tool streaming in Chat API)."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "service_name": {"type": "string"},
+            "replica_count": {"type": "integer"},
+            "healthy": {"type": "boolean"},
+            "environment": {"type": "string", "enum": ["prod", "staging"]},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+    res = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": Constants.MODEL_GPT_SOL,
+            "messages": [{"role": "user", "content": "Return service status adhering to schema"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "service_status", "schema": schema},
+            },
+            "seed": 7,
+        },
+    )
+    assert res.status_code == 200
+    parsed = json.loads(res.json()["choices"][0]["message"]["content"])
+    assert isinstance(parsed["service_name"], str)
+    assert isinstance(parsed["replica_count"], int)
+    assert isinstance(parsed["healthy"], bool)
+    assert parsed["environment"] in ["prod", "staging"]
+    assert isinstance(parsed["tags"], list)
+
+    # Multi-tool streaming in /v1/chat/completions
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_cpu_usage",
+                "parameters": {"type": "object", "properties": {"host": {"type": "string"}}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_memory_usage",
+                "parameters": {"type": "object", "properties": {"host": {"type": "string"}}},
+            },
+        },
+    ]
+    stream_res = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": Constants.MODEL_CLAUDE_SONNET,
+            "messages": [{"role": "user", "content": "Check CPU and memory usage"}],
+            "tools": tools,
+            "stream": True,
+        },
+    )
+    assert stream_res.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in stream_res.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    streamed_indices = {
+        tc["index"]
+        for c in chunks
+        for tc in c["choices"][0].get("delta", {}).get("tool_calls", [])
+    }
+    assert streamed_indices == {0, 1}
+
+
+def test_p1_reversible_tokenizer_and_lexical_reranker() -> None:
+    """Verify P1-3 (lossless tokenize/detokenize round-trip) and P1-6 (lexical rerank relevance ordering)."""
+    original_text = "Hello, world! Testing reversible BPE-style mock tokenization 2026."
+    tok_res = client.post(
+        "/tokenize",
+        json={"model": Constants.MODEL_GPT_SOL, "prompt": original_text, "add_special_tokens": True},
+    )
+    assert tok_res.status_code == 200
+    tokens = tok_res.json()["tokens"]
+
+    detok_res = client.post(
+        "/detokenize",
+        json={"model": Constants.MODEL_GPT_SOL, "tokens": tokens},
+    )
+    assert detok_res.status_code == 200
+    assert detok_res.json()["prompt"] == original_text
+
+    # Verify /v1/rerank ranks the matching document first
+    rerank_res = client.post(
+        "/v1/rerank",
+        json={
+            "model": Constants.MODEL_RERANKER,
+            "query": "Kubernetes pod horizontal autoscaling CPU utilization",
+            "documents": [
+                "Baking sourdough bread requires flour, water, salt, and starter fermentation.",
+                "Kubernetes HorizontalPodAutoscaler automatically scales pods based on CPU utilization metrics.",
+                "Medieval castles featured stone curtain walls and defensive moats.",
+            ],
+        },
+    )
+    assert rerank_res.status_code == 200
+    results = rerank_res.json()["results"]
+    assert results[0]["index"] == 1
+    assert results[0]["relevance_score"] > results[1]["relevance_score"]
+
+
+def test_p1_chaos_error_simulation_and_413_file_limit(monkeypatch: Any) -> None:
+    """Verify P1-4 (chaos headers 429/500/503 & malformed SSE) and P1-5 (413 file size enforcement)."""
+    # 1. Deterministic status error injection via X-Mock-Error-Status
+    for status_code in (429, 500, 503):
+        err_res = client.post(
+            "/v1/chat/completions",
+            headers={Constants.HEADER_MOCK_ERROR_STATUS: str(status_code)},
+            json={"model": Constants.MODEL_GPT_SOL, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert err_res.status_code == status_code
+        assert "error" in err_res.json()
+
+    # 2. Malformed SSE stream injection via X-Mock-Malformed-SSE
+    malformed_res = client.post(
+        "/v1/chat/completions",
+        headers={Constants.HEADER_MOCK_MALFORMED_SSE: "true"},
+        json={"model": Constants.MODEL_GPT_SOL, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert malformed_res.status_code == 200
+    assert "truncated_malformed_sse_frame" in malformed_res.text
+
+    # 3. File upload exceeding MOCK_MAX_FILE_BYTES returns HTTP 413
+    monkeypatch.setenv("MOCK_MAX_FILE_BYTES", "64")
+    oversized_res = client.post(
+        "/v1/files",
+        files={"file": ("oversized.jsonl", b"x" * 128, "application/jsonl")},
+        data={"purpose": "batch"},
+    )
+    assert oversized_res.status_code == 413
+
 

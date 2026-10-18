@@ -146,10 +146,12 @@ class ResponsesRequest(FlexibleRequestModel):
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = True
     text: dict[str, Any] | None = None
     reasoning: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     previous_response_id: str | None = None
+    seed: int | None = None
     store: bool = True
 
 
@@ -162,6 +164,7 @@ class EmbeddingRequest(FlexibleRequestModel):
     encoding_format: Literal["float", "base64"] = "float"
     dimensions: int | None = None
     user: str | None = None
+    seed: int | None = None
 
 
 class PoolingRequest(FlexibleRequestModel):

@@ -94,15 +94,20 @@ All model identifiers, vLLM engine version (`0.32.0`), default endpoint models, 
 | `PORT` | — | `8000` | HTTP listening port |
 | `MOCK_VLLM_VERSION` | — | `"0.32.0"` | vLLM engine version reported by `/version` and `/server_info` |
 | `MOCK_API_KEY` | `Authorization: Bearer <key>` | `""` (disabled) | If set, enforces Bearer token authentication on non-public routes |
+| `MOCK_CORS_ORIGINS` | — | `"*"` | Comma-separated list of allowed CORS origins |
 | `MOCK_LATENCY_MS` | `X-Mock-Latency-Ms` | `0` | Artificial delay (ms) applied before returning responses |
 | `MOCK_STREAM_DELAY_MS` | `X-Mock-Stream-Delay-Ms` | `0` | Artificial delay (ms) between streamed SSE token chunks |
 | `MOCK_INCLUDE_REASONING` | — | `"true"` | Controls whether `reasoning_content` is included in chat responses |
+| `MOCK_DETERMINISTIC` | Request body `"seed"` | `"false"` | Enables deterministic output generation hashed from request payload or `seed` |
+| `MOCK_STATE_DB_PATH` | — | `""` (in-memory) | Optional SQLite WAL database path for cross-replica / multi-worker shared state (emits startup warning if unset) |
+| `MOCK_ERROR_RATE` | `X-Mock-Error-Rate`, `X-Mock-Error-Status`, `X-Mock-Malformed-SSE` | `0.0` | Chaos & error simulation rate (`0.0`–`1.0`), deterministic status (`429`/`500`/`503`), or malformed SSE stream injection |
 | `MOCK_ENABLE_LOGGING` | — | `"true"` | Enables non-blocking `stdout` streaming request logging (no file I/O) |
 | `MOCK_LOG_FORMAT` | — | `"json"` | Stdout log format for Docker/Kubernetes (`"json"` or `"text"`) |
 | `MOCK_LOG_LEVEL` | — | `"INFO"` | Logging verbosity (`"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`) |
 | `MOCK_ENABLE_OBSERVABILITY` | `X-Request-ID`, `X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP` | `"true"` | Injects `X-Request-ID`, `X-Client-IP`, `X-Process-Time-Ms`, and `X-Response-Time` headers |
-| `MOCK_MAX_STORE_SIZE` | — | `500` | Maximum items retained in each bounded in-memory store before FIFO/LRU eviction |
-| `MOCK_MAX_FILE_BYTES` | — | `65536` | Maximum bytes read/stored per uploaded file to prevent memory bloat |
+| `MOCK_MAX_STORE_SIZE` | — | `500` | Maximum items retained in each bounded store before FIFO/LRU eviction |
+| `MOCK_MAX_STORE_BYTES` | — | `16777216` (16 MiB) | Maximum total serialized bytes retained per store before FIFO/LRU eviction |
+| `MOCK_MAX_FILE_BYTES` | — | `65536` | Maximum bytes allowed per uploaded file (`413 Content Too Large` returned if exceeded) |
 
 ---
 

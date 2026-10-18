@@ -10,7 +10,7 @@ import os
 
 
 class Constants:
-    """Single source of truth for versions, model names, defaults, logging, and resource limits."""
+    """Single source of truth for versions, model names, defaults, logging, security, and resource limits."""
 
     # -----------------------------------------------------------------------
     # 1. Server & vLLM Engine Version Metadata
@@ -105,14 +105,22 @@ class Constants:
     )
 
     # -----------------------------------------------------------------------
-    # 4. Memory-Safe Store Bounds & Per-Request Resource Caps
+    # 4. Memory-Safe Store Bounds, Optional SQLite State & Resource Caps
     # -----------------------------------------------------------------------
     MAX_STORE_SIZE: int = int(os.environ.get("MOCK_MAX_STORE_SIZE", "500"))
+    MAX_STORE_BYTES: int = int(os.environ.get("MOCK_MAX_STORE_BYTES", str(16 * 1024 * 1024)))
     MAX_THREAD_SUBSTORE_SIZE: int = 100
     MAX_STORED_FILE_BYTES: int = int(os.environ.get("MOCK_MAX_FILE_BYTES", "65536"))
     MAX_CHOICES_N: int = 16
     MAX_BATCH_INPUT_ITEMS: int = 32
     MAX_STORED_INPUT_MESSAGES: int = 64
+    MAX_PARALLEL_TOOL_CALLS: int = 4
+
+    # Optional SQLite file path for multi-replica / multi-worker state consistency
+    STATE_DB_PATH: str = os.environ.get("MOCK_STATE_DB_PATH", "").strip()
+
+    # Deterministic mode: when true, identical inputs always yield identical outputs even without `seed`
+    DETERMINISTIC_MODE: bool = os.environ.get("MOCK_DETERMINISTIC", "false").lower() in ("1", "true", "yes", "on")
 
     DEFAULT_EMBEDDING_DIMENSIONS: int = 1536
     DEFAULT_POOLING_DIMENSIONS: int = 128
@@ -138,7 +146,7 @@ class Constants:
     SEED_ASSISTANT_ID: str = "asst_mock2026architect"
 
     # -----------------------------------------------------------------------
-    # 6. Stdout Streaming Logging, Real-IP, Response Time & Request-ID Config
+    # 6. Stdout Streaming Logging, Real-IP, Response Time, Chaos & Security
     # -----------------------------------------------------------------------
     LOGGER_NAME: str = "openai_vllm_mock"
     ENABLE_LOGGING: bool = os.environ.get("MOCK_ENABLE_LOGGING", "true").lower() in ("1", "true", "yes", "on")
@@ -152,11 +160,24 @@ class Constants:
         "on",
     )
 
+    CORS_ALLOW_ORIGINS: list[str] = [
+        origin.strip()
+        for origin in os.environ.get("MOCK_CORS_ORIGINS", "*").split(",")
+        if origin.strip()
+    ]
+
     HEADER_REQUEST_ID: str = "X-Request-ID"
     HEADER_CORRELATION_ID: str = "X-Correlation-ID"
     HEADER_PROCESS_TIME_MS: str = "X-Process-Time-Ms"
     HEADER_RESPONSE_TIME: str = "X-Response-Time"
     HEADER_CLIENT_IP: str = "X-Client-IP"
+
+    # Chaos / Fault Injection Headers
+    HEADER_MOCK_ERROR_STATUS: str = "X-Mock-Error-Status"
+    HEADER_MOCK_ERROR_RATE: str = "X-Mock-Error-Rate"
+    HEADER_MOCK_ERROR_MESSAGE: str = "X-Mock-Error-Message"
+    HEADER_MOCK_MALFORMED_SSE: str = "X-Mock-Malformed-SSE"
+    DEFAULT_ERROR_RATE: float = float(os.environ.get("MOCK_ERROR_RATE", "0.0"))
 
     # Priority order for real client IP extraction behind reverse proxies / K8s Ingress / Cloudflare
     REAL_IP_HEADERS: tuple[str, ...] = (

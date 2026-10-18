@@ -1,78 +1,286 @@
 """
-Curated 2026 State-of-the-Art English list[dict] datasets, bounded memory-safe stores,
-and generator utilities for the OpenAI & vLLM compatible FastAPI mock server.
-All model names, engine versions, and store bounds are sourced from `Constants`.
+Curated 2026 State-of-the-Art English list[dict] datasets, byte-bounded + optional SQLite
+stateful stores, deterministic PRNG helpers, recursive JSON Schema synthesizer, reversible
+tokenizer, and lexical reranker/scorer for the OpenAI & vLLM compatible FastAPI mock server.
 """
 
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
+import contextlib
+import hashlib
 import io
 import json
 import math
+import os
 import random
+import re
+import sqlite3
 import struct
-from collections import OrderedDict
 from typing import Any
+import uuid
 
 from constants import Constants
 
 # ---------------------------------------------------------------------------
-# 0. Memory-Safe Bounded Store Containers (Prevents OOM / Memory Leaks)
+# 0. Byte-Bounded & Optional SQLite-Backed Store Containers
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_STORE_SIZE = Constants.MAX_STORE_SIZE
+DEFAULT_MAX_STORE_BYTES = Constants.MAX_STORE_BYTES
 MAX_STORED_FILE_CONTENT_BYTES = Constants.MAX_STORED_FILE_BYTES
+
+
+def _estimate_bytes(obj: Any) -> int:
+    """Estimates the serialized UTF-8 byte footprint of a store entry."""
+    try:
+        return len(json.dumps(obj, default=str).encode("utf-8"))
+    except Exception:
+        return 256
+
+
+def get_active_state_db_path() -> str:
+    """Returns the configured SQLite state DB path if enabled via env or Constants."""
+    return os.environ.get("MOCK_STATE_DB_PATH", Constants.STATE_DB_PATH).strip()
+
+
+class _SQLiteStateSync:
+    """
+    Lightweight process-safe SQLite state synchronizer using stdlib `sqlite3` (WAL mode).
+    Used when `MOCK_STATE_DB_PATH` is configured so multiple Kubernetes replicas or
+    Gunicorn/Uvicorn workers share stateful resources (files, responses, threads, batches).
+    """
+
+    _initialized_paths: set[str] = set()
+
+    @classmethod
+    def _ensure_schema(cls, db_path: str) -> None:
+        if db_path in cls._initialized_paths and os.path.exists(db_path):
+            return
+        parent = os.path.dirname(os.path.abspath(db_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mock_store_state (
+                    store_name TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        cls._initialized_paths.add(db_path)
+
+    @classmethod
+    def load(cls, store_name: str | None) -> Any | None:
+        db_path = get_active_state_db_path()
+        if not db_path or not store_name:
+            return None
+        try:
+            cls._ensure_schema(db_path)
+            with contextlib.closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM mock_store_state WHERE store_name = ?",
+                    (store_name,),
+                ).fetchone()
+                if row and row[0]:
+                    return json.loads(row[0])
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def save(cls, store_name: str | None, payload: Any) -> None:
+        db_path = get_active_state_db_path()
+        if not db_path or not store_name:
+            return
+        try:
+            cls._ensure_schema(db_path)
+            serialized = json.dumps(payload, default=str)
+            with contextlib.closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO mock_store_state (store_name, payload_json)
+                    VALUES (?, ?)
+                    ON CONFLICT(store_name) DO UPDATE SET payload_json = excluded.payload_json
+                    """,
+                    (store_name, serialized),
+                )
+                conn.commit()
+        except Exception:
+            return
 
 
 class BoundedListStore(list):
     """
-    A list[dict] subclass that enforces a strict upper bound on element count.
-    When new items are appended beyond `max_size`, the oldest items
-    are automatically evicted in FIFO order to prevent unbounded memory growth.
+    A list[dict] subclass that enforces strict upper bounds on both item count (`max_size`)
+    and total serialized byte footprint (`max_bytes`). Optionally syncs with SQLite when
+    `MOCK_STATE_DB_PATH` is set.
     """
 
-    def __init__(self, initial: list[dict[str, Any]] | None = None, max_size: int = Constants.MAX_STORE_SIZE) -> None:
+    def __init__(
+        self,
+        initial: list[dict[str, Any]] | None = None,
+        max_size: int = Constants.MAX_STORE_SIZE,
+        max_bytes: int = Constants.MAX_STORE_BYTES,
+        store_name: str | None = None,
+    ) -> None:
         super().__init__(initial or [])
-        self.max_size = max(10, max_size)
+        self.max_size = max(1, max_size)
+        self.max_bytes = max(1, max_bytes)
+        self.store_name = store_name
+        self._item_bytes: list[int] = [_estimate_bytes(x) for x in self]
+        self.current_bytes: int = sum(self._item_bytes)
         self._trim()
+
+    @property
+    def total_bytes(self) -> int:
+        return self.current_bytes
+
+    def _sync_from_db(self) -> None:
+        loaded = _SQLiteStateSync.load(self.store_name)
+        if isinstance(loaded, list):
+            super().__init__(loaded)
+            self._item_bytes = [_estimate_bytes(x) for x in self]
+            self.current_bytes = sum(self._item_bytes)
+
+    def _sync_to_db(self) -> None:
+        if self.store_name and get_active_state_db_path():
+            _SQLiteStateSync.save(self.store_name, list(self))
 
     def _trim(self) -> None:
-        while len(self) > self.max_size:
+        while len(self) > self.max_size or (len(self) > 1 and self.current_bytes > self.max_bytes):
             super().pop(0)
+            if self._item_bytes:
+                removed = self._item_bytes.pop(0)
+                self.current_bytes = max(0, self.current_bytes - removed)
 
     def append(self, item: dict[str, Any]) -> None:
+        self._sync_from_db()
         super().append(item)
+        sz = _estimate_bytes(item)
+        self._item_bytes.append(sz)
+        self.current_bytes += sz
         self._trim()
+        self._sync_to_db()
 
     def extend(self, iterable: Any) -> None:
-        super().extend(iterable)
+        self._sync_from_db()
+        items = list(iterable)
+        super().extend(items)
+        for item in items:
+            sz = _estimate_bytes(item)
+            self._item_bytes.append(sz)
+            self.current_bytes += sz
         self._trim()
+        self._sync_to_db()
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        super().__setitem__(index, value)
+        self._item_bytes = [_estimate_bytes(x) for x in self]
+        self.current_bytes = sum(self._item_bytes)
+        self._trim()
+        self._sync_to_db()
+
+    def __iter__(self) -> Any:
+        self._sync_from_db()
+        return super().__iter__()
 
 
 class BoundedDictStore(OrderedDict):
     """
-    An OrderedDict subclass with strict LRU/FIFO capacity eviction.
-    Guarantees O(1) bounded memory usage even under continuous load testing.
+    An OrderedDict subclass with strict LRU/FIFO capacity eviction by both entry count
+    (`max_size`) and total serialized byte footprint (`max_bytes`). Optionally syncs
+    with SQLite when `MOCK_STATE_DB_PATH` is configured.
     """
 
-    def __init__(self, initial: dict[str, Any] | None = None, max_size: int = Constants.MAX_STORE_SIZE) -> None:
+    def __init__(
+        self,
+        initial: dict[str, Any] | None = None,
+        max_size: int = Constants.MAX_STORE_SIZE,
+        max_bytes: int = Constants.MAX_STORE_BYTES,
+        store_name: str | None = None,
+    ) -> None:
         super().__init__()
-        self.max_size = max(10, max_size)
+        self.max_size = max(1, max_size)
+        self.max_bytes = max(1, max_bytes)
+        self.store_name = store_name
+        self._entry_bytes: dict[str, int] = {}
+        self.current_bytes: int = 0
         if initial:
             for k, v in initial.items():
                 self[k] = v
 
+    @property
+    def total_bytes(self) -> int:
+        return self.current_bytes
+
+    def _sync_from_db(self) -> None:
+        loaded = _SQLiteStateSync.load(self.store_name)
+        if isinstance(loaded, dict):
+            super().clear()
+            self._entry_bytes.clear()
+            self.current_bytes = 0
+            for k, v in loaded.items():
+                super().__setitem__(k, v)
+                sz = _estimate_bytes(v)
+                self._entry_bytes[k] = sz
+                self.current_bytes += sz
+
+    def _sync_to_db(self) -> None:
+        if self.store_name and get_active_state_db_path():
+            _SQLiteStateSync.save(self.store_name, dict(self))
+
+    def _trim(self) -> None:
+        while len(self) > self.max_size or (len(self) > 1 and self.current_bytes > self.max_bytes):
+            oldest_key, _ = self.popitem(last=False)
+            removed_sz = self._entry_bytes.pop(oldest_key, 0)
+            self.current_bytes = max(0, self.current_bytes - removed_sz)
+
     def __setitem__(self, key: str, value: Any) -> None:
+        self._sync_from_db()
         if key in self:
             self.move_to_end(key)
+            self.current_bytes = max(0, self.current_bytes - self._entry_bytes.get(key, 0))
         super().__setitem__(key, value)
-        while len(self) > self.max_size:
-            self.popitem(last=False)
+        sz = _estimate_bytes(value)
+        self._entry_bytes[key] = sz
+        self.current_bytes += sz
+        self._trim()
+        self._sync_to_db()
+
+    def __getitem__(self, key: str) -> Any:
+        self._sync_from_db()
+        return super().__getitem__(key)
+
+    def __contains__(self, key: object) -> bool:
+        self._sync_from_db()
+        return super().__contains__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        self._sync_from_db()
+        return super().get(key, default)
+
+    def pop(self, key: str, *args: Any) -> Any:
+        self._sync_from_db()
+        val = super().pop(key, *args)
+        removed_sz = self._entry_bytes.pop(key, 0)
+        self.current_bytes = max(0, self.current_bytes - removed_sz)
+        self._sync_to_db()
+        return val
+
+    def values(self) -> Any:
+        self._sync_from_db()
+        return super().values()
 
     def setdefault(self, key: str, default: Any = None) -> Any:
+        self._sync_from_db()
         if key in self:
             self.move_to_end(key)
-            return self[key]
+            return super().__getitem__(key)
         self[key] = default
         return default
 
@@ -497,7 +705,8 @@ MOCK_MODELS: BoundedListStore = BoundedListStore(
             "parent": None,
             "max_model_len": 8192,
         },
-    ]
+    ],
+    store_name="models",
 )
 
 # ---------------------------------------------------------------------------
@@ -625,7 +834,7 @@ MOCK_CLASSIFICATIONS: list[dict[str, Any]] = [
 ]
 
 # ---------------------------------------------------------------------------
-# 6. Memory-Bounded Stateful Stores (Initialized with 2026 SOTA English dicts)
+# 6. Memory-Bounded Stateful Stores (with optional SQLite store_name sync)
 # ---------------------------------------------------------------------------
 MOCK_FILES_STORE: BoundedListStore = BoundedListStore(
     [
@@ -656,7 +865,8 @@ MOCK_FILES_STORE: BoundedListStore = BoundedListStore(
                 '{"role": "assistant", "content": "It separates compute-bound prefill from bandwidth-bound decode over RDMA."}]}\n'
             ),
         },
-    ]
+    ],
+    store_name="files",
 )
 
 MOCK_BATCHES_STORE: BoundedListStore = BoundedListStore(
@@ -683,12 +893,13 @@ MOCK_BATCHES_STORE: BoundedListStore = BoundedListStore(
             "request_counts": {"total": 50, "completed": 50, "failed": 0},
             "metadata": {"environment": "production-2026", "model": Constants.MODEL_CLAUDE_OPUS},
         }
-    ]
+    ],
+    store_name="batches",
 )
 
-MOCK_RESPONSES_STORE: BoundedDictStore = BoundedDictStore()
+MOCK_RESPONSES_STORE: BoundedDictStore = BoundedDictStore(store_name="responses")
 
-MOCK_CHAT_COMPLETIONS_STORE: BoundedDictStore = BoundedDictStore()
+MOCK_CHAT_COMPLETIONS_STORE: BoundedDictStore = BoundedDictStore(store_name="chat_completions")
 
 MOCK_VOICES: list[dict[str, Any]] = [
     {"voice_id": "sol", "name": "Sol", "language": "en-US", "gender": "neutral"},
@@ -718,10 +929,11 @@ MOCK_FINE_TUNING_STORE: BoundedListStore = BoundedListStore(
             "error": {},
             "seed": 42,
         }
-    ]
+    ],
+    store_name="fine_tuning",
 )
 
-MOCK_UPLOADS_STORE: BoundedDictStore = BoundedDictStore()
+MOCK_UPLOADS_STORE: BoundedDictStore = BoundedDictStore(store_name="uploads")
 
 MOCK_VECTOR_STORES: BoundedListStore = BoundedListStore(
     [
@@ -736,7 +948,8 @@ MOCK_VECTOR_STORES: BoundedListStore = BoundedListStore(
             "last_active_at": 1775005000,
             "metadata": {"domain": "disaggregated_serving_and_rlvr", "language": "en"},
         }
-    ]
+    ],
+    store_name="vector_stores",
 )
 
 MOCK_ASSISTANTS_STORE: BoundedListStore = BoundedListStore(
@@ -754,35 +967,58 @@ MOCK_ASSISTANTS_STORE: BoundedListStore = BoundedListStore(
             "temperature": 1.0,
             "top_p": 1.0,
         }
-    ]
+    ],
+    store_name="assistants",
 )
 
-MOCK_THREADS_STORE: BoundedDictStore = BoundedDictStore()
-MOCK_THREAD_MESSAGES_STORE: BoundedDictStore = BoundedDictStore()
-MOCK_THREAD_RUNS_STORE: BoundedDictStore = BoundedDictStore()
+MOCK_THREADS_STORE: BoundedDictStore = BoundedDictStore(store_name="threads")
+MOCK_THREAD_MESSAGES_STORE: BoundedDictStore = BoundedDictStore(store_name="thread_messages")
+MOCK_THREAD_RUNS_STORE: BoundedDictStore = BoundedDictStore(store_name="thread_runs")
 
 
 # ---------------------------------------------------------------------------
-# 7. Generator & Helper Functions
+# 7. Deterministic PRNG, Reversible Tokenizer, JSON Schema Synthesizer & Scorer
 # ---------------------------------------------------------------------------
-def get_random_response_dict() -> dict[str, Any]:
-    """Selects a random English response dictionary from MOCK_RESPONSES."""
-    return random.choice(MOCK_RESPONSES)
+def get_rng(seed: int | None = None, payload_key: str | None = None) -> random.Random:
+    """
+    Returns a deterministic `random.Random` instance when `seed` is provided or
+    `MOCK_DETERMINISTIC=true` is active; otherwise returns an unseeded `random.Random`.
+    """
+    deterministic_env = os.environ.get("MOCK_DETERMINISTIC", str(Constants.DETERMINISTIC_MODE)).lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if seed is not None or deterministic_env:
+        digest_input = f"seed={seed if seed is not None else 0}|key={payload_key or ''}"
+        seed_int = int.from_bytes(hashlib.sha256(digest_input.encode("utf-8")).digest()[:8], "big")
+        return random.Random(seed_int)
+    return random.Random()
 
 
-def get_random_transcription_dict() -> dict[str, Any]:
-    """Selects a random English transcription dictionary from MOCK_TRANSCRIPTIONS."""
-    return random.choice(MOCK_TRANSCRIPTIONS)
+def get_random_response_dict(rng: random.Random | None = None) -> dict[str, Any]:
+    """Selects an English response dictionary from MOCK_RESPONSES using optional deterministic RNG."""
+    active_rng = rng or random
+    return active_rng.choice(MOCK_RESPONSES)
 
 
-def get_random_image_dict() -> dict[str, Any]:
-    """Selects a random English image prompt dictionary from MOCK_IMAGE_PROMPTS."""
-    return random.choice(MOCK_IMAGE_PROMPTS)
+def get_random_transcription_dict(rng: random.Random | None = None) -> dict[str, Any]:
+    """Selects an English transcription dictionary from MOCK_TRANSCRIPTIONS."""
+    active_rng = rng or random
+    return active_rng.choice(MOCK_TRANSCRIPTIONS)
 
 
-def get_random_classification_dict() -> dict[str, Any]:
-    """Selects a random classification dictionary from MOCK_CLASSIFICATIONS."""
-    return random.choice(MOCK_CLASSIFICATIONS)
+def get_random_image_dict(rng: random.Random | None = None) -> dict[str, Any]:
+    """Selects an English image prompt dictionary from MOCK_IMAGE_PROMPTS."""
+    active_rng = rng or random
+    return active_rng.choice(MOCK_IMAGE_PROMPTS)
+
+
+def get_random_classification_dict(rng: random.Random | None = None) -> dict[str, Any]:
+    """Selects a classification dictionary from MOCK_CLASSIFICATIONS."""
+    active_rng = rng or random
+    return active_rng.choice(MOCK_CLASSIFICATIONS)
 
 
 def estimate_tokens(text: str) -> int:
@@ -793,96 +1029,258 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(len(words) * 1.3))
 
 
+# Reversible bidirectional vocabulary table for /tokenize and /detokenize
+_TOKEN_ID_TO_STR: BoundedDictStore = BoundedDictStore(max_size=20000)
+_STR_TO_TOKEN_ID: BoundedDictStore = BoundedDictStore(max_size=20000)
+
+
+def _seed_reversible_vocab() -> None:
+    """Pre-populates common vocabulary tokens from MOCK_RESPONSES so arbitrary IDs also decode."""
+    for entry in MOCK_RESPONSES:
+        pieces = re.findall(r"\s*\S+|\s+", entry["content"])
+        for piece in pieces:
+            digest = int.from_bytes(hashlib.sha256(piece.encode("utf-8")).digest()[:4], "big")
+            tok_id = (digest % 90000) + 1000
+            _TOKEN_ID_TO_STR[str(tok_id)] = piece
+            _STR_TO_TOKEN_ID[piece] = tok_id
+
+
+_seed_reversible_vocab()
+
+
 def simple_tokenize(text: str) -> list[int]:
-    """Deterministic lightweight tokenizer converting English text to token IDs."""
+    """
+    Reversible deterministic tokenizer converting English text to integer token IDs.
+    Preserves exact whitespace and punctuation pieces in a bounded lookup table so
+    `simple_detokenize(simple_tokenize(text)) == text` round-trips losslessly.
+    """
     if not text:
         return []
+    pieces = re.findall(r"\s*\S+|\s+", text)
     tokens: list[int] = []
-    parts = text.split(" ")
-    for idx, part in enumerate(parts):
-        piece = part if idx == 0 else " " + part
-        if piece:
-            token_id = (sum(ord(ch) * (i + 1) for i, ch in enumerate(piece)) % 50000) + 256
-            tokens.append(token_id)
+    for piece in pieces:
+        existing = _STR_TO_TOKEN_ID.get(piece)
+        if existing is not None:
+            tokens.append(int(existing))
+            continue
+        digest = int.from_bytes(hashlib.sha256(piece.encode("utf-8")).digest()[:4], "big")
+        tok_id = (digest % 90000) + 1000
+        # Resolve rare hash collision if different string occupies tok_id
+        while str(tok_id) in _TOKEN_ID_TO_STR and _TOKEN_ID_TO_STR[str(tok_id)] != piece:
+            tok_id += 1
+        _TOKEN_ID_TO_STR[str(tok_id)] = piece
+        _STR_TO_TOKEN_ID[piece] = tok_id
+        tokens.append(tok_id)
     return tokens
 
 
 def simple_detokenize(token_ids: list[int]) -> str:
-    """Produces a clean English sentence from token IDs."""
+    """
+    Reconstructs the exact original text for token IDs produced by `simple_tokenize`,
+    and falls back to deterministic vocabulary words for arbitrary unseen integer IDs.
+    """
     if not token_ids:
         return ""
-    sample = get_random_response_dict()["content"]
-    words = sample.split()
-    selected = [words[i % len(words)] for i in range(len(token_ids))]
-    return " ".join(selected)
+    fallback_words = MOCK_RESPONSES[0]["content"].split()
+    out_pieces: list[str] = []
+    for idx, tid in enumerate(token_ids):
+        if tid == Constants.BOS_TOKEN_ID:
+            continue
+        mapped = _TOKEN_ID_TO_STR.get(str(tid))
+        if mapped is not None:
+            out_pieces.append(str(mapped))
+        else:
+            word = fallback_words[abs(tid) % len(fallback_words)]
+            out_pieces.append(word if idx == 0 or not out_pieces else f" {word}")
+    return "".join(out_pieces)
 
 
-def synthesize_tool_arguments(parameters_schema: dict[str, Any] | None, fallback_args: dict[str, Any]) -> dict[str, Any]:
+def synthesize_from_json_schema(
+    schema: dict[str, Any] | None,
+    fallback_obj: dict[str, Any] | None = None,
+    root_schema: dict[str, Any] | None = None,
+    rng: random.Random | None = None,
+    depth: int = 0,
+) -> Any:
+    """
+    Recursively synthesizes a valid JSON value conforming to a user-provided JSON Schema
+    (`response_format.json_schema.schema`, `guided_json`, or tool `parameters`).
+    """
+    active_rng = rng or random
+    fallback = fallback_obj or MOCK_RESPONSES[0]["structured_json"]
+    if not schema or not isinstance(schema, dict) or depth > 8:
+        return fallback
+
+    root = root_schema or schema
+
+    # 1. Resolve local $ref (#/$defs/Name or #/definitions/Name)
+    if "$ref" in schema and isinstance(schema["$ref"], str):
+        ref_path = schema["$ref"]
+        if ref_path.startswith("#/"):
+            target: Any = root
+            for part in ref_path.lstrip("#/").split("/"):
+                if isinstance(target, dict):
+                    target = target.get(part)
+                else:
+                    target = None
+                    break
+            if isinstance(target, dict):
+                return synthesize_from_json_schema(target, fallback, root, active_rng, depth + 1)
+
+    # 2. Handle const and enum
+    if "const" in schema:
+        return schema["const"]
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        return active_rng.choice(schema["enum"])
+
+    # 3. Handle anyOf / oneOf / allOf
+    for combiner in ("anyOf", "oneOf"):
+        if combiner in schema and isinstance(schema[combiner], list) and schema[combiner]:
+            non_null = [s for s in schema[combiner] if isinstance(s, dict) and s.get("type") != "null"]
+            chosen_sub = non_null[0] if non_null else schema[combiner][0]
+            return synthesize_from_json_schema(chosen_sub, fallback, root, active_rng, depth + 1)
+
+    if "allOf" in schema and isinstance(schema["allOf"], list) and schema["allOf"]:
+        merged: dict[str, Any] = {"type": "object", "properties": {}}
+        for sub in schema["allOf"]:
+            if isinstance(sub, dict) and isinstance(sub.get("properties"), dict):
+                merged["properties"].update(sub["properties"])
+        return synthesize_from_json_schema(merged, fallback, root, active_rng, depth + 1)
+
+    # 4. Determine primitive or composite type
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        schema_type = next((t for t in schema_type if t != "null"), "string")
+    if not schema_type:
+        if "properties" in schema:
+            schema_type = "object"
+        elif "items" in schema:
+            schema_type = "array"
+        else:
+            schema_type = "string"
+
+    if schema_type == "object":
+        properties = schema.get("properties")
+        if not isinstance(properties, dict) or not properties:
+            return fallback if depth == 0 else {"key": "value"}
+        result_obj: dict[str, Any] = {}
+        for prop_name, prop_spec in properties.items():
+            if not isinstance(prop_spec, dict):
+                result_obj[prop_name] = "sample_value"
+                continue
+            if prop_name in fallback and not any(k in prop_spec for k in ("properties", "items", "enum", "const", "$ref")):
+                val_candidate = fallback[prop_name]
+                expected_t = prop_spec.get("type")
+                if (
+                    (expected_t == "string" and isinstance(val_candidate, str))
+                    or (expected_t == "integer" and isinstance(val_candidate, int))
+                    or (expected_t == "number" and isinstance(val_candidate, (int, float)))
+                    or (expected_t == "boolean" and isinstance(val_candidate, bool))
+                ):
+                    result_obj[prop_name] = val_candidate
+                    continue
+            result_obj[prop_name] = _synthesize_named_property(prop_name, prop_spec, fallback, root, active_rng, depth + 1)
+        return result_obj
+
+    if schema_type == "array":
+        item_schema = schema.get("items")
+        min_items = int(schema.get("minItems", 1))
+        max_items = int(schema.get("maxItems", max(2, min_items)))
+        count = max(min_items, min(2, max_items))
+        if isinstance(item_schema, dict):
+            return [
+                synthesize_from_json_schema(item_schema, fallback, root, active_rng, depth + 1)
+                for _ in range(count)
+            ]
+        return ["item_alpha", "item_beta"][:count]
+
+    if schema_type == "integer":
+        low = int(schema.get("minimum", 1))
+        high = int(schema.get("maximum", max(low + 100, 42)))
+        return max(low, min(42, high))
+
+    if schema_type == "number":
+        low_f = float(schema.get("minimum", 0.0))
+        high_f = float(schema.get("maximum", max(low_f + 1.0, 1.0)))
+        return round(max(low_f, min(0.98, high_f)), 4)
+
+    if schema_type == "boolean":
+        return True
+
+    if schema_type == "null":
+        return None
+
+    return schema.get("default", "sample_value")
+
+
+def _synthesize_named_property(
+    prop_name: str,
+    prop_spec: dict[str, Any],
+    fallback: dict[str, Any],
+    root: dict[str, Any],
+    rng: random.Random,
+    depth: int,
+) -> Any:
+    prop_type = prop_spec.get("type")
+    if isinstance(prop_type, list):
+        prop_type = next((t for t in prop_type if t != "null"), "string")
+
+    if (
+        prop_type in ("object", "array", "integer", "number", "boolean", "null")
+        or "enum" in prop_spec
+        or "const" in prop_spec
+        or "$ref" in prop_spec
+        or "anyOf" in prop_spec
+        or "oneOf" in prop_spec
+    ):
+        return synthesize_from_json_schema(prop_spec, fallback, root, rng, depth)
+
+    lower_name = prop_name.lower()
+    if "city" in lower_name or "location" in lower_name:
+        return "San Francisco, CA"
+    if "query" in lower_name or "search" in lower_name:
+        return str(fallback.get("query", "disaggregated prefill decode architecture"))
+    if "model" in lower_name:
+        return Constants.DEFAULT_CHAT_MODEL
+    if "status" in lower_name:
+        return "optimal"
+    if "name" in lower_name or "title" in lower_name:
+        return f"mock_{prop_name}"
+    return f"mock_{prop_name}_value"
+
+
+def synthesize_tool_arguments(
+    parameters_schema: dict[str, Any] | None,
+    fallback_args: dict[str, Any],
+    rng: random.Random | None = None,
+) -> dict[str, Any]:
     """
     Generates realistic English arguments matching a JSON Schema `parameters` object
     when provided, falling back to `fallback_args` from MOCK_RESPONSES.
     """
     if not parameters_schema or not isinstance(parameters_schema, dict):
         return fallback_args
-
-    properties = parameters_schema.get("properties")
-    if not properties or not isinstance(properties, dict):
-        return fallback_args
-
-    synthesized: dict[str, Any] = {}
-    for prop_name, prop_spec in properties.items():
-        if not isinstance(prop_spec, dict):
-            synthesized[prop_name] = "sample_value"
-            continue
-
-        if "enum" in prop_spec and isinstance(prop_spec["enum"], list) and prop_spec["enum"]:
-            synthesized[prop_name] = random.choice(prop_spec["enum"])
-            continue
-
-        prop_type = prop_spec.get("type", "string")
-        if isinstance(prop_type, list):
-            prop_type = next((t for t in prop_type if t != "null"), "string")
-
-        if prop_type == "string":
-            if "city" in prop_name.lower() or "location" in prop_name.lower():
-                synthesized[prop_name] = "San Francisco, CA"
-            elif "query" in prop_name.lower() or "search" in prop_name.lower():
-                synthesized[prop_name] = fallback_args.get("query", "disaggregated prefill decode architecture")
-            elif "model" in prop_name.lower():
-                synthesized[prop_name] = Constants.DEFAULT_CHAT_MODEL
-            else:
-                synthesized[prop_name] = f"mock_{prop_name}_value"
-        elif prop_type == "integer":
-            synthesized[prop_name] = 42
-        elif prop_type == "number":
-            synthesized[prop_name] = 0.98
-        elif prop_type == "boolean":
-            synthesized[prop_name] = True
-        elif prop_type == "array":
-            synthesized[prop_name] = ["item_alpha", "item_beta"]
-        elif prop_type == "object":
-            synthesized[prop_name] = {"key": "value"}
-        else:
-            synthesized[prop_name] = "sample_value"
-
-    return synthesized
+    synthesized = synthesize_from_json_schema(parameters_schema, fallback_args, parameters_schema, rng)
+    return synthesized if isinstance(synthesized, dict) else fallback_args
 
 
 def build_tool_calls(
     tools: list[dict[str, Any]] | None,
     tool_choice: Any,
     sample_entry: dict[str, Any],
+    parallel_tool_calls: bool | None = True,
+    rng: random.Random | None = None,
 ) -> list[dict[str, Any]]:
     """
     Builds OpenAI-compatible tool_calls list if tools are supplied and tool_choice
-    is not 'none'.
+    is not 'none'. Supports multiple parallel tool calls when `parallel_tool_calls` is True.
     """
-    import uuid
-
     if not tools or tool_choice == "none":
         return []
 
-    chosen_tool = tools[0]
+    active_rng = rng or random
+    selected_tools: list[dict[str, Any]] = []
+
     if isinstance(tool_choice, dict):
         target_name = (
             tool_choice.get("function", {}).get("name")
@@ -892,37 +1290,77 @@ def build_tool_calls(
             for t in tools:
                 fn = t.get("function", t)
                 if fn.get("name") == target_name:
-                    chosen_tool = t
+                    selected_tools = [t]
                     break
+        if not selected_tools:
+            selected_tools = [tools[0]]
+    elif parallel_tool_calls is False or len(tools) == 1:
+        selected_tools = [tools[0]]
+    else:
+        selected_tools = tools[: Constants.MAX_PARALLEL_TOOL_CALLS]
 
-    fn_spec = chosen_tool.get("function", chosen_tool)
-    fn_name = fn_spec.get("name", "mock_function")
-    fn_params = fn_spec.get("parameters")
-    args_dict = synthesize_tool_arguments(fn_params, sample_entry["tool_call_arguments"])
+    built_calls: list[dict[str, Any]] = []
+    for idx, chosen_tool in enumerate(selected_tools):
+        fn_spec = chosen_tool.get("function", chosen_tool)
+        fn_name = fn_spec.get("name", f"mock_function_{idx}")
+        fn_params = fn_spec.get("parameters")
+        args_dict = synthesize_tool_arguments(fn_params, sample_entry["tool_call_arguments"], active_rng)
+        call_hex = f"{active_rng.getrandbits(96):024x}" if rng is not None else uuid.uuid4().hex[:24]
+        built_calls.append(
+            {
+                "id": f"call_{call_hex}",
+                "type": "function",
+                "function": {
+                    "name": fn_name,
+                    "arguments": json.dumps(args_dict),
+                },
+            }
+        )
+    return built_calls
 
-    return [
-        {
-            "id": f"call_{uuid.uuid4().hex[:24]}",
-            "type": "function",
-            "function": {
-                "name": fn_name,
-                "arguments": json.dumps(args_dict),
-            },
-        }
-    ]
+
+def compute_relevance_score(query: str, document: str) -> float:
+    """
+    Computes a deterministic lexical + character 3-gram similarity score in [0.05, 0.99]
+    so `/v1/rerank` and `/v1/score` rank genuinely matching documents higher than unrelated ones.
+    """
+    q_clean = query.strip().lower()
+    d_clean = document.strip().lower()
+    if not q_clean or not d_clean:
+        return 0.05
+    if q_clean == d_clean:
+        return 0.99
+
+    q_tokens = set(re.findall(r"[a-z0-9]+", q_clean))
+    d_tokens = set(re.findall(r"[a-z0-9]+", d_clean))
+    token_overlap = (len(q_tokens & d_tokens) / max(1, len(q_tokens))) if q_tokens else 0.0
+
+    def _trigrams(s: str) -> set[str]:
+        padded = f"  {s}  "
+        return {padded[i : i + 3] for i in range(max(1, len(padded) - 2))}
+
+    q_tri = _trigrams(q_clean)
+    d_tri = _trigrams(d_clean)
+    jaccard_tri = len(q_tri & d_tri) / max(1, len(q_tri | d_tri))
+
+    substring_bonus = 0.25 if q_clean in d_clean else 0.0
+    raw_score = 0.10 + (0.55 * token_overlap) + (0.30 * jaccard_tri) + substring_bonus
+    return round(max(0.05, min(0.99, raw_score)), 4)
 
 
 def generate_embedding_vector(
     dimensions: int = Constants.DEFAULT_EMBEDDING_DIMENSIONS,
     encoding_format: str = "float",
+    rng: random.Random | None = None,
 ) -> list[float] | str:
     """
     Generates a normalized unit-length embedding vector in either `float` list
     or `base64` encoded float32 bytes. Bounds maximum dimension to Constants.MAX_EMBEDDING_DIMENSIONS
-    to prevent excessive per-request memory allocation.
+    and supports deterministic seeding via `rng`.
     """
+    active_rng = rng or random
     safe_dims = max(1, min(dimensions, Constants.MAX_EMBEDDING_DIMENSIONS))
-    raw = [random.uniform(-1.0, 1.0) for _ in range(safe_dims)]
+    raw = [active_rng.uniform(-1.0, 1.0) for _ in range(safe_dims)]
     norm = math.sqrt(sum(x * x for x in raw)) or 1.0
     normalized = [round(x / norm, 6) for x in raw]
 

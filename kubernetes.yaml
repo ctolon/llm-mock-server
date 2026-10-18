@@ -1,4 +1,14 @@
 apiVersion: v1
+kind: Secret
+metadata:
+  name: openai-vllm-mock-secret
+  labels:
+    app: openai-vllm-mock
+type: Opaque
+stringData:
+  MOCK_API_KEY: ""
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: openai-vllm-mock-config
@@ -6,7 +16,6 @@ metadata:
     app: openai-vllm-mock
 data:
   PORT: "8000"
-  MOCK_API_KEY: ""
   MOCK_LATENCY_MS: "0"
   MOCK_STREAM_DELAY_MS: "0"
   MOCK_INCLUDE_REASONING: "true"
@@ -15,7 +24,12 @@ data:
   MOCK_LOG_FORMAT: "json"
   MOCK_LOG_LEVEL: "INFO"
   MOCK_ENABLE_OBSERVABILITY: "true"
+  MOCK_DETERMINISTIC: "false"
+  MOCK_STATE_DB_PATH: ""
+  MOCK_CORS_ORIGINS: "*"
+  MOCK_ERROR_RATE: "0.0"
   MOCK_MAX_STORE_SIZE: "500"
+  MOCK_MAX_STORE_BYTES: "16777216"
   MOCK_MAX_FILE_BYTES: "65536"
 ---
 apiVersion: apps/v1
@@ -25,7 +39,9 @@ metadata:
   labels:
     app: openai-vllm-mock
 spec:
-  replicas: 2
+  # Default to 1 replica when MOCK_STATE_DB_PATH is empty to guarantee stateful CRUD consistency.
+  # If scaling >1 replicas, mount a shared volume and set MOCK_STATE_DB_PATH="/data/mock_state.db".
+  replicas: 1
   selector:
     matchLabels:
       app: openai-vllm-mock
@@ -38,10 +54,21 @@ spec:
         prometheus.io/port: "8000"
         prometheus.io/path: "/metrics"
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
       containers:
         - name: openai-vllm-mock
           image: openai-vllm-mock:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http
               containerPort: 8000
@@ -49,6 +76,13 @@ spec:
           envFrom:
             - configMapRef:
                 name: openai-vllm-mock-config
+            - secretRef:
+                name: openai-vllm-mock-secret
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
+            - name: state-dir
+              mountPath: /data
           livenessProbe:
             httpGet:
               path: /health
@@ -70,6 +104,11 @@ spec:
             limits:
               cpu: "500m"
               memory: "512Mi"
+      volumes:
+        - name: tmp-dir
+          emptyDir: {}
+        - name: state-dir
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -79,6 +118,10 @@ metadata:
     app: openai-vllm-mock
 spec:
   type: ClusterIP
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
   selector:
     app: openai-vllm-mock
   ports:
@@ -86,24 +129,3 @@ spec:
       port: 8000
       targetPort: http
       protocol: TCP
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: openai-vllm-mock-hpa
-  labels:
-    app: openai-vllm-mock
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: openai-vllm-mock
-  minReplicas: 2
-  maxReplicas: 10
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 75
